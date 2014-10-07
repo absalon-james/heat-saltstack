@@ -1,0 +1,177 @@
+heat_template_version: 2013-05-23
+
+description: |
+  Deploys a salt-master.
+
+parameters:
+
+  keyname:
+    type: string
+    label: Salt-Master Keyname.
+    description: The name of the key that should be used to ssh into the Salt-Master.
+
+  image:
+    type: string
+    label: Image Name
+    description: Name of the existing image to use for every vm spun up by this stack. The image should have heat-config and heat-config-script baked in.
+
+  floating-network-id:
+    type: string
+    label: External Network UUID
+    description: UUID of the external network. The private network created by this stack will route to this network. Also, any floating ip's needed by this stack will come this network.
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Flavor of all vms. This may be changed in the future to allow different flavors for the different vms in this stack.
+    default: m1.small
+
+resources:
+
+  # Random string to aid in naming things.
+  stack-string:
+    type: OS::Heat::RandomString
+    properties:
+      length: 6
+      sequence: lettersdigits
+
+  # Private network for this stack
+  net:
+    type: OS::Neutron::Net
+    properties:
+      name:
+        str_replace:
+          template: saltstack-$stackstr-net
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+
+  # Private subnet for this stack
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id:
+        get_resource: net
+      cidr: 10.10.10.0/24
+      dns_nameservers:
+        - 8.8.8.8
+        - 4.2.2.2
+
+  # Routes the private network to the external network.
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: 
+          get_param: floating-network-id
+
+  # Router interface
+  interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id:
+        get_resource: router
+      subnet_id: 
+        get_resource: subnet
+
+  # One floating ip for the salt-master node
+  master-ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: 
+        get_param: floating-network-id
+
+  # One port for the salt-master node
+  master-port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: 
+        get_resource: net
+
+  # Software configuration script for the salt-master node
+  # Installs salt-master, sets permission on some personality files
+  # and uses git to clone any provided state/formula repos
+  config-salt-master:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        # Install salt master
+        echo "Install Salt Master"
+        curl -L http://bootstrap.saltstack.org | sh -s -- -M -N
+        mkdir /srv/salt
+        echo -e 'file_roots:\n  base:\n    - /srv/salt' >> /etc/salt/master
+        # Finally - Restart salt service
+        service salt-master restart
+
+  # Software deployment for salt-master. Deploys the salt-master softrware
+  # configuration.
+  # Also lists the git repos necessary to make the drupal stack work.
+  deploy-salt-master:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: config-salt-master
+      server:
+        get_resource: master
+
+  # The salt master instance
+  # Should have one floating ip
+  master:
+    type: OS::Nova::Server
+    depends_on: interface
+    properties:
+      key_name:
+        get_param: keyname
+      image: 
+        get_param: image
+      flavor:
+        get_param: flavor
+      name:
+        str_replace:
+          template: saltstack-$stackstr-master
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+     
+      # Get access from the master-port
+      networks:
+        - port:
+            get_resource: master-port
+
+      # Using SoftwareConfigs - This needs to be set to SOFTWARE_CONFIG
+      user_data_format: SOFTWARE_CONFIG
+
+  # Associate the master floating ip to the master port
+  master-floating-ip-ass: 
+    type: OS::Neutron::FloatingIPAssociation
+    properties: 
+      floatingip_id:
+        get_resource: master-ip
+      port_id:
+        get_resource: master-port
+
+outputs:
+  master-ip:
+    description: Saltstack Master
+    value: 
+      get_attr:
+        - master-ip
+        - floating_ip_address
+  
+  # Uncomment the stdout's and stderr's if problems are occuring.
+  #master-stdout:
+  #  value:
+  #    get_attr:
+  #     - deploy-salt-master
+  #     - deploy_stdout
+  #master-stderr:
+  #  value:
+  #    get_attr:
+  #      - deploy-salt-master
+  #      - deploy_stderr
